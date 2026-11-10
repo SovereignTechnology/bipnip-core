@@ -59,7 +59,7 @@ bitcoin = "0.32.102"
 # Leading `::hkdf` in chat code avoids ambiguity with `nostr_sdk::prelude::hkdf`.
 hkdf = "0.13.0"
 sha2 = "0.11.0"
-secp256k1 = "0.30"
+secp256k1 = { version = "0.30", features = ["recovery"] }
 
 [features]
 default = ["wasm"]

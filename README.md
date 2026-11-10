@@ -1,3 +1,9 @@
+> **This is bipnip's fork of mostro-core** ([`SovereignTechnology/bipnip-core`](https://github.com/SovereignTechnology/bipnip-core)),
+> the protocol crate of [bipnip](https://github.com/SovereignTechnology/bipnip): Mostro's types unchanged (wire
+> compatible), plus Lightning liquidity messages and the node ↔ Nostr key binding (`src/node_binding.rs`). It is
+> not affiliated with the Mostro project. Upstream: [MostroP2P/mostro-core](https://github.com/MostroP2P/mostro-core),
+> forked at v0.17.3 and tracked release by release. License unchanged: MIT.
+
 # Mostro Core
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)

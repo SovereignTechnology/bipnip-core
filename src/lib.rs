@@ -86,6 +86,7 @@ pub mod db;
 pub mod dispute;
 pub mod error;
 pub mod message;
+pub mod node_binding;
 pub mod order;
 pub mod payer;
 pub mod prelude;
