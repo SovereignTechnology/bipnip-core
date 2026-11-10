@@ -586,6 +586,62 @@ mod tests {
         ],
     ];
 
+    // Produced by real nodes on regtest in bipnip's M0 spike (spikes/ln-m0, 2026-11-10): LND
+    // v0.21.5-beta `lncli signmessage` and ldk-node 0.7.1 `Node::sign_message`. Throwaway keys.
+    const SPIKE_MSG: &str = "bipnip M0 spike: Lightning signed message";
+    const SPIKE_VECTORS: [[&str; 3]; 3] = [
+        [
+            "lnd-v0.21.5-beta-alice",
+            "ryc5mqfxokuhz58kipdrx4jcw7kofsi4cjehi4h3ttxa79ccqaacrmi1hq4rogiman19c3pwh3dauw7jzq5j71s55fstraghx3rs3ou5",
+            "02a2c49f01de3015a832c1551745106ee704c8c9aab1fef9dab8de5125d6dbab5f",
+        ],
+        [
+            "lnd-v0.21.5-beta-bob",
+            "d9ywkc1i89foksxw1gc4ksr3zeijb9wfaeehrqtdmzjwgzkk1au94hik7axn3ktbbzr4aokhtunnwjpgnxp4echkrzg97s7dcgbkw7gs",
+            "02290bfd8a728a5c65d925f0abec649d3dcdabd391218f3a507d8f5a404cfbcd32",
+        ],
+        [
+            "ldk-node-0.7.1",
+            "dhuz1i8qnr8jj3pwxeughzw3x3nfb1i4dxdi8y3jk1ggbeek1qttqfku88iz3s78yhshfm1euw1sp5xw7pa45eoknxu9q43cxifh94tt",
+            "0371e42290241390eea888ce76b14537797568b111f1e43ec47e4d35ae356ba245",
+        ],
+    ];
+    // Binding statements signed by the same LND nodes (`lncli signmessage <statement>`).
+    const SPIKE_STATEMENTS: [[&str; 2]; 2] = [
+        [
+            "nostr-node-binding:v1:bind:regtest:abababababababababababababababababababababababababababababababab:02a2c49f01de3015a832c1551745106ee704c8c9aab1fef9dab8de5125d6dbab5f:1794302273",
+            "ryjpprs859mhcy1ck5fq1n8c4i34zg6bp7rz6borxhdycqyqcbddnic73j5rqk463y5x8n5ix9yynxg8y73m8o9acozgbykps13mgpn4",
+        ],
+        [
+            "nostr-node-binding:v1:bind:regtest:abababababababababababababababababababababababababababababababab:02290bfd8a728a5c65d925f0abec649d3dcdabd391218f3a507d8f5a404cfbcd32:1794302273",
+            "rdiu4zwr7ez6msk9sxz6zttmxrepkb93n9yhutk5hi9cyo5sfayaejpt7n4jdcq586kj8wgsnmj5t7x6xtjux5p8spabqx9qp8nzy8kq",
+        ],
+    ];
+
+    #[test]
+    fn real_node_signatures_recover() {
+        for [name, sig, key] in SPIKE_VECTORS {
+            let pk = recover_ln_signer(SPIKE_MSG.as_bytes(), sig).expect(name);
+            assert_eq!(pk.to_string(), key, "{name}");
+        }
+    }
+
+    #[test]
+    fn real_node_binding_statements_verify() {
+        for [text, sig] in SPIKE_STATEMENTS {
+            let statement = Statement::parse(text).expect("parses");
+            let signed = SignedStatement {
+                statement,
+                node_signature: sig.to_string(),
+            };
+            assert_eq!(signed.verify(), Ok(()));
+            // The same signature over a different timestamp does not verify.
+            let mut moved = signed.clone();
+            moved.statement.created_at += 1;
+            assert_eq!(moved.verify(), Err(BindingError::WrongSigner));
+        }
+    }
+
     #[test]
     fn cln_corpus_recovers_exact_keys() {
         for [msg, sig, key] in CLN_CORPUS {
