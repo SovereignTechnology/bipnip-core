@@ -10,6 +10,7 @@
 //! sender's trade keys using [`Message::sign`], and wrapped in a NIP-44
 //! direct event by [`crate::transport::wrap_message_with`].
 
+use crate::lease_message::LeasePayload;
 use crate::prelude::*;
 use bitcoin::hashes::sha256::Hash as Sha256Hash;
 use bitcoin::hashes::Hash;
@@ -238,6 +239,34 @@ pub enum Action {
     /// [`Action::ImportReputation`]. Direction: destination → client.
     /// Payload must be `None`.
     ReputationImported,
+    /// bipnip: a seller offers liquidity leases; the instance echoes it back with
+    /// the order id. Direction: seller → instance, instance → seller.
+    /// Payload: [`Payload::Lease`] ([`LeasePayload::Offer`]).
+    LeaseOffer,
+    /// bipnip: a buyer takes a lease offer with the contract it made (payment
+    /// hash only). Direction: buyer → instance → seller.
+    /// Payload: [`Payload::Lease`] ([`LeasePayload::Take`]).
+    TakeLease,
+    /// bipnip: the seller's hold invoice on the buyer's hash for the upfront
+    /// share. Direction: seller → instance → buyer.
+    /// Payload: [`Payload::Lease`] ([`LeasePayload::Invoice`]).
+    LeaseInvoice,
+    /// bipnip: the seller reports the funding outpoint of the channel it
+    /// opened. Direction: seller → instance → buyer.
+    /// Payload: [`Payload::Lease`] ([`LeasePayload::Channel`]).
+    LeaseChannelOpened,
+    /// bipnip: the buyer releases the preimage after its own node verified
+    /// the channel. Direction: buyer → seller, peer to peer; never sent to or
+    /// through an instance.
+    /// Payload: [`Payload::Lease`] ([`LeasePayload::Preimage`]).
+    LeasePreimage,
+    /// bipnip: the seller settled the upfront invoice; the lease runs.
+    /// Direction: seller → instance → buyer. Payload must be `None`.
+    LeaseActive,
+    /// bipnip: the seller's ordinary invoice for the completion share at
+    /// lease end. Direction: seller → instance → buyer.
+    /// Payload: [`Payload::Lease`] ([`LeasePayload::Invoice`]).
+    LeaseCompletionInvoice,
 }
 
 impl fmt::Display for Action {
@@ -823,6 +852,9 @@ pub enum Payload {
     /// The requester's own reputation on this node, carried by
     /// [`Action::UserInfo`] from Mostro to the client.
     UserInfo(UserInfo),
+    /// bipnip: the payload of a liquidity-lease action. See
+    /// [`crate::lease_message`].
+    Lease(LeasePayload),
 }
 
 #[allow(dead_code)]
@@ -999,8 +1031,20 @@ impl MessageKind {
                         | Some(Payload::PayerDeclaration(_))
                         | Some(Payload::PaymentHistory(_))
                         | Some(Payload::UserInfo(_))
+                        | Some(Payload::Lease(_))
                 )
             }
+            Action::LeaseOffer
+            | Action::TakeLease
+            | Action::LeaseInvoice
+            | Action::LeaseChannelOpened
+            | Action::LeasePreimage
+            | Action::LeaseActive
+            | Action::LeaseCompletionInvoice => crate::lease_message::shape_ok(
+                &self.action,
+                self.id.is_some(),
+                self.payload.as_ref(),
+            ),
             Action::LastTradeIndex | Action::RestoreSession => self.payload.is_none(),
             Action::UserInfo => {
                 self.id.is_none() && matches!(&self.payload, None | Some(Payload::UserInfo(_)))
@@ -1361,7 +1405,14 @@ mod test {
             | Action::ReputationExported
             | Action::ImportReputation
             | Action::ReputationImported
-            | Action::Orders => {}
+            | Action::Orders
+            | Action::LeaseOffer
+            | Action::TakeLease
+            | Action::LeaseInvoice
+            | Action::LeaseChannelOpened
+            | Action::LeasePreimage
+            | Action::LeaseActive
+            | Action::LeaseCompletionInvoice => {}
         };
 
         let other_actions: &[Action] = &[
@@ -1423,6 +1474,13 @@ mod test {
             Action::ReputationExported,
             Action::ImportReputation,
             Action::ReputationImported,
+            Action::LeaseOffer,
+            Action::TakeLease,
+            Action::LeaseInvoice,
+            Action::LeaseChannelOpened,
+            Action::LeasePreimage,
+            Action::LeaseActive,
+            Action::LeaseCompletionInvoice,
         ];
 
         for action in other_actions {
