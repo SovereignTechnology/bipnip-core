@@ -30,6 +30,7 @@ use bitcoin::hashes::{sha256d, Hash};
 use nostr_sdk::prelude::{Event, EventBuilder, Kind, Tag, Timestamp};
 use secp256k1::ecdsa::{RecoverableSignature, RecoveryId};
 use secp256k1::{Message as SecpMessage, PublicKey, Secp256k1, SecretKey};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Prefix every Lightning implementation puts in front of a message before hashing it.
 pub const LN_MESSAGE_PREFIX: &[u8] = b"Lightning Signed Message:";
@@ -268,6 +269,21 @@ impl FromStr for Network {
             "regtest" => Ok(Network::Regtest),
             _ => Err(BindingError::Statement("unknown network")),
         }
+    }
+}
+
+/// Serialized as the canonical name ([`Network::as_str`]).
+impl Serialize for Network {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+/// Only the canonical names are accepted.
+impl<'de> Deserialize<'de> for Network {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let name = String::deserialize(deserializer)?;
+        Network::from_str(&name).map_err(|_| serde::de::Error::custom("unknown network"))
     }
 }
 
