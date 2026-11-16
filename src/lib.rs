@@ -85,6 +85,7 @@ pub mod chat;
 pub mod db;
 pub mod dispute;
 pub mod error;
+pub mod lease;
 pub mod message;
 pub mod node_binding;
 pub mod order;
