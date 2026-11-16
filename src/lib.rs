@@ -87,6 +87,7 @@ pub mod dispute;
 pub mod error;
 pub mod lease;
 pub mod lease_message;
+pub mod lease_order;
 pub mod message;
 pub mod node_binding;
 pub mod order;
