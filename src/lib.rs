@@ -98,5 +98,6 @@ pub mod reputation;
 pub mod response;
 pub mod ring;
 pub mod ring_message;
+pub mod ring_order;
 pub mod transport;
 pub mod user;
