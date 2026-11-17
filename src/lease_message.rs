@@ -108,7 +108,7 @@ fn node_key(s: &str, what: &'static str) -> Result<PublicKey, LeaseMessageError>
 
 /// `host:port`, where host is a DNS name, an onion name, an IPv4 address, or an IPv6 address in
 /// brackets, and port is 1..=65535 without leading zeros. Shape only: nothing is resolved.
-fn valid_node_address(s: &str) -> bool {
+pub(crate) fn valid_node_address(s: &str) -> bool {
     if s.len() > MAX_NODE_ADDRESS_LEN {
         return false;
     }

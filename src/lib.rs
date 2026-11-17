@@ -96,5 +96,7 @@ pub mod prelude;
 pub mod rating;
 pub mod reputation;
 pub mod response;
+pub mod ring;
+pub mod ring_message;
 pub mod transport;
 pub mod user;
