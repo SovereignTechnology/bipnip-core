@@ -12,6 +12,7 @@
 
 use crate::lease_message::LeasePayload;
 use crate::prelude::*;
+use crate::ring_message::RingPayload;
 use bitcoin::hashes::sha256::Hash as Sha256Hash;
 use bitcoin::hashes::Hash;
 use nostr_sdk::prelude::*;
@@ -267,6 +268,38 @@ pub enum Action {
     /// lease end. Direction: seller → instance → buyer.
     /// Payload: [`Payload::Lease`] ([`LeasePayload::Invoice`]).
     LeaseCompletionInvoice,
+    /// bipnip: a creator proposes a liquidity ring and takes its first slot;
+    /// the instance echoes it back with the order id. Direction: creator →
+    /// instance, instance → creator.
+    /// Payload: [`Payload::Ring`] ([`RingPayload::Offer`]).
+    RingOffer,
+    /// bipnip: a node runner takes an open slot of a ring. Direction:
+    /// member → instance.
+    /// Payload: [`Payload::Ring`] ([`RingPayload::Take`]).
+    TakeRingSlot,
+    /// bipnip: the ring is full; its members and their order are fixed.
+    /// Direction: instance → every member.
+    /// Payload: [`Payload::Ring`] ([`RingPayload::Roster`]).
+    RingRoster,
+    /// bipnip: a member signs the ring id. Direction: member → instance.
+    /// Payload: [`Payload::Ring`] ([`RingPayload::Commit`]).
+    RingCommit,
+    /// bipnip: every member has committed; the window to open channels
+    /// runs. Direction: instance → every member.
+    /// Payload: [`Payload::Ring`] ([`RingPayload::Open`]).
+    RingOpen,
+    /// bipnip: a member reports the funding outpoint of the channel it
+    /// opened to the next member. Direction: opener → instance → receiver.
+    /// Payload: [`Payload::Ring`] ([`RingPayload::Edge`]).
+    RingEdgeOpened,
+    /// bipnip: a member's own node confirmed the channel opened to it.
+    /// Direction: receiver → instance → opener.
+    /// Payload: [`Payload::Ring`] ([`RingPayload::Edge`]).
+    RingEdgeVerified,
+    /// bipnip: the ring is over; says which members' channels were
+    /// confirmed. Direction: instance → every member.
+    /// Payload: [`Payload::Ring`] ([`RingPayload::Closed`]).
+    RingClosed,
 }
 
 impl fmt::Display for Action {
@@ -855,6 +888,9 @@ pub enum Payload {
     /// bipnip: the payload of a liquidity-lease action. See
     /// [`crate::lease_message`].
     Lease(LeasePayload),
+    /// bipnip: the payload of a liquidity-ring action. See
+    /// [`crate::ring_message`].
+    Ring(RingPayload),
 }
 
 #[allow(dead_code)]
@@ -1032,6 +1068,7 @@ impl MessageKind {
                         | Some(Payload::PaymentHistory(_))
                         | Some(Payload::UserInfo(_))
                         | Some(Payload::Lease(_))
+                        | Some(Payload::Ring(_))
                 )
             }
             Action::LeaseOffer
@@ -1041,6 +1078,18 @@ impl MessageKind {
             | Action::LeasePreimage
             | Action::LeaseActive
             | Action::LeaseCompletionInvoice => crate::lease_message::shape_ok(
+                &self.action,
+                self.id.is_some(),
+                self.payload.as_ref(),
+            ),
+            Action::RingOffer
+            | Action::TakeRingSlot
+            | Action::RingRoster
+            | Action::RingCommit
+            | Action::RingOpen
+            | Action::RingEdgeOpened
+            | Action::RingEdgeVerified
+            | Action::RingClosed => crate::ring_message::shape_ok(
                 &self.action,
                 self.id.is_some(),
                 self.payload.as_ref(),
@@ -1412,7 +1461,15 @@ mod test {
             | Action::LeaseChannelOpened
             | Action::LeasePreimage
             | Action::LeaseActive
-            | Action::LeaseCompletionInvoice => {}
+            | Action::LeaseCompletionInvoice
+            | Action::RingOffer
+            | Action::TakeRingSlot
+            | Action::RingRoster
+            | Action::RingCommit
+            | Action::RingOpen
+            | Action::RingEdgeOpened
+            | Action::RingEdgeVerified
+            | Action::RingClosed => {}
         };
 
         let other_actions: &[Action] = &[
@@ -1481,6 +1538,14 @@ mod test {
             Action::LeasePreimage,
             Action::LeaseActive,
             Action::LeaseCompletionInvoice,
+            Action::RingOffer,
+            Action::TakeRingSlot,
+            Action::RingRoster,
+            Action::RingCommit,
+            Action::RingOpen,
+            Action::RingEdgeOpened,
+            Action::RingEdgeVerified,
+            Action::RingClosed,
         ];
 
         for action in other_actions {
