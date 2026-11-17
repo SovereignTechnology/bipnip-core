@@ -26,6 +26,12 @@ pub const MAX_RING_SIZE: usize = 5;
 pub const MIN_OPEN_WINDOW_SECS: u64 = 3_600;
 /// Longest time members may be given to open their channel: two weeks.
 pub const MAX_OPEN_WINDOW_SECS: u64 = 14 * 24 * 3_600;
+/// Shortest window on regtest: a minute, so a test can run a window to its end.
+pub const MIN_OPEN_WINDOW_SECS_REGTEST: u64 = 60;
+/// Longest window a ring with bonds may have: 48 hours. A bond is a payment held at the
+/// instance's node for the whole window, and a held payment ties up liquidity on every node in
+/// its path.
+pub const MAX_BONDED_WINDOW_SECS: u64 = 48 * 3_600;
 
 /// Why ring terms or a roster were rejected.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,6 +64,9 @@ pub struct RingTerms {
     pub announce: bool,
     /// Seconds members have to open their channel, counted from the roster's `created_at`.
     pub open_window_secs: u64,
+    /// What each member locks at the instance until the ring ends, in satoshi; 0 for none. A
+    /// member whose channel is missing when the window ends loses it to the member it failed.
+    pub bond_sat: u64,
 }
 
 impl RingTerms {
@@ -66,8 +75,25 @@ impl RingTerms {
         if !(MIN_CAPACITY_SAT..=MAX_CAPACITY_SAT).contains(&self.capacity_sat) {
             return Err(RingError::Term("capacity_sat"));
         }
-        if !(MIN_OPEN_WINDOW_SECS..=MAX_OPEN_WINDOW_SECS).contains(&self.open_window_secs) {
+        let shortest = match self.network {
+            Network::Regtest => MIN_OPEN_WINDOW_SECS_REGTEST,
+            _ => MIN_OPEN_WINDOW_SECS,
+        };
+        if !(shortest..=MAX_OPEN_WINDOW_SECS).contains(&self.open_window_secs) {
             return Err(RingError::Term("open_window_secs"));
+        }
+        if self.bond_sat > 0 {
+            // A bond is taken only on what the instance's own node can see, so the channels
+            // must be announced; and it is held for the whole window, so the window is short.
+            if !self.announce {
+                return Err(RingError::Term("a bond needs announced channels"));
+            }
+            if self.open_window_secs > MAX_BONDED_WINDOW_SECS {
+                return Err(RingError::Term("a bond needs a window of 48 hours or less"));
+            }
+            if self.bond_sat > self.capacity_sat || !crate::bond::bond_amount_ok(self.bond_sat) {
+                return Err(RingError::Term("bond_sat"));
+            }
         }
         Ok(())
     }
@@ -118,17 +144,18 @@ impl Ring {
     /// The canonical text (ASCII, no spaces; members separated by commas, in opening order):
     ///
     /// ```text
-    /// bipnip-ring:v1:<network>:<capacity_sat>:<announce 0|1>:<open_window_secs>:<created_at>:
-    /// <node 1>,<node 2>,…,<node N>
+    /// bipnip-ring:v1:<network>:<capacity_sat>:<announce 0|1>:<open_window_secs>:<bond_sat>:
+    /// <created_at>:<node 1>,<node 2>,…,<node N>
     /// ```
     pub fn text(&self) -> String {
         let members: Vec<String> = self.members.iter().map(ToString::to_string).collect();
         format!(
-            "bipnip-ring:v1:{}:{}:{}:{}:{}:{}",
+            "bipnip-ring:v1:{}:{}:{}:{}:{}:{}:{}",
             self.terms.network.as_str(),
             self.terms.capacity_sat,
             u8::from(self.terms.announce),
             self.terms.open_window_secs,
+            self.terms.bond_sat,
             self.created_at,
             members.join(",")
         )
@@ -146,7 +173,7 @@ impl Ring {
     /// parsed values, or failing [`Ring::validate`], is rejected.
     pub fn parse(text: &str) -> Result<Self, RingError> {
         let f: Vec<&str> = text.split(':').collect();
-        if f.len() != 8 || f[0] != "bipnip-ring" || f[1] != "v1" {
+        if f.len() != 9 || f[0] != "bipnip-ring" || f[1] != "v1" {
             return Err(RingError::Roster("header"));
         }
         let network = f[2]
@@ -158,7 +185,7 @@ impl Ring {
             _ => return Err(RingError::Roster("announce")),
         };
         let mut members = Vec::new();
-        for node in f[7].split(',') {
+        for node in f[8].split(',') {
             if !is_lower_hex(node, 66) {
                 return Err(RingError::Roster("member"));
             }
@@ -170,9 +197,10 @@ impl Ring {
                 capacity_sat: parse_num(f[3], "capacity_sat")?,
                 announce,
                 open_window_secs: parse_num(f[5], "open_window_secs")?,
+                bond_sat: parse_num(f[6], "bond_sat")?,
             },
             members,
-            created_at: parse_num(f[6], "created_at")?,
+            created_at: parse_num(f[7], "created_at")?,
         };
         ring.validate()?;
         if ring.text() != text {
@@ -224,6 +252,7 @@ mod tests {
                 capacity_sat: 2_000_000,
                 announce: true,
                 open_window_secs: 48 * 3_600,
+                bond_sat: 0,
             },
             members: (1..=size).map(node).collect(),
             created_at: 1_794_800_000,
@@ -234,7 +263,7 @@ mod tests {
     fn the_text_is_stable_and_the_id_is_its_hash() {
         let r = ring(3);
         let expected = format!(
-            "bipnip-ring:v1:regtest:2000000:1:172800:1794800000:{},{},{}",
+            "bipnip-ring:v1:regtest:2000000:1:172800:0:1794800000:{},{},{}",
             node(1),
             node(2),
             node(3)
@@ -326,13 +355,72 @@ mod tests {
             Err(RingError::Term("capacity_sat"))
         );
         assert_eq!(
-            with(&|r| r.terms.open_window_secs = MIN_OPEN_WINDOW_SECS - 1),
+            with(&|r| r.terms.open_window_secs = MIN_OPEN_WINDOW_SECS_REGTEST - 1),
             Err(RingError::Term("open_window_secs"))
         );
         assert_eq!(
             with(&|r| r.terms.open_window_secs = MAX_OPEN_WINDOW_SECS + 1),
             Err(RingError::Term("open_window_secs"))
         );
+    }
+
+    #[test]
+    fn a_bond_needs_announced_channels_and_a_short_window() {
+        let mut bonded = ring(3);
+        bonded.terms.bond_sat = 50_000;
+        assert!(bonded.validate().is_ok());
+        // The bond is part of the text every member signs.
+        assert!(bonded.text().contains(":172800:50000:1794800000:"));
+        assert_ne!(bonded.id(), ring(3).id());
+        assert_eq!(Ring::parse(&bonded.text()), Ok(bonded.clone()));
+
+        let with = |change: &dyn Fn(&mut Ring)| {
+            let mut r = bonded.clone();
+            change(&mut r);
+            r.validate()
+        };
+        assert_eq!(
+            with(&|r| r.terms.announce = false),
+            Err(RingError::Term("a bond needs announced channels"))
+        );
+        assert_eq!(
+            with(&|r| r.terms.open_window_secs = MAX_BONDED_WINDOW_SECS + 1),
+            Err(RingError::Term("a bond needs a window of 48 hours or less"))
+        );
+        assert_eq!(
+            with(&|r| r.terms.bond_sat = r.terms.capacity_sat + 1),
+            Err(RingError::Term("bond_sat"))
+        );
+        assert_eq!(
+            with(&|r| r.terms.bond_sat = crate::bond::MIN_BOND_SAT - 1),
+            Err(RingError::Term("bond_sat"))
+        );
+        // Without a bond neither rule applies.
+        let mut free = ring(3);
+        free.terms.announce = false;
+        free.terms.open_window_secs = MAX_OPEN_WINDOW_SECS;
+        assert!(free.validate().is_ok());
+    }
+
+    #[test]
+    fn only_regtest_allows_a_window_under_an_hour() {
+        let mut quick = ring(3);
+        quick.terms.open_window_secs = MIN_OPEN_WINDOW_SECS_REGTEST;
+        assert!(quick.validate().is_ok());
+        quick.terms.open_window_secs = MIN_OPEN_WINDOW_SECS_REGTEST - 1;
+        assert!(quick.validate().is_err());
+        for network in [Network::Bitcoin, Network::Signet, Network::Testnet4] {
+            let mut real = ring(3);
+            real.terms.network = network;
+            real.terms.open_window_secs = MIN_OPEN_WINDOW_SECS - 1;
+            assert_eq!(
+                real.validate(),
+                Err(RingError::Term("open_window_secs")),
+                "{network:?}"
+            );
+            real.terms.open_window_secs = MIN_OPEN_WINDOW_SECS;
+            assert!(real.validate().is_ok());
+        }
     }
 
     #[test]
@@ -347,6 +435,8 @@ mod tests {
             text.replace(":1:172800:", ":2:172800:"),
             text.replace(":1:172800:", ":true:172800:"),
             text.replace(":172800:", ":+172800:"),
+            text.replace(":172800:0:", ":172800:00:"),
+            text.replace(":172800:0:", ":172800:"),
             text.replace(&node(2).to_string(), &node(2).to_string().to_uppercase()),
             text.replace(&format!(",{}", node(3)), ""),
             text.replace(&format!(",{}", node(3)), &format!(",{}", node(1))),

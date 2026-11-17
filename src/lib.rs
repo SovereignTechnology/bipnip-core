@@ -80,6 +80,7 @@
 #![doc(html_root_url = "https://docs.rs/mostro-core")]
 #![warn(missing_docs)]
 
+pub mod bond;
 pub mod chat;
 #[cfg(feature = "sqlx")]
 pub mod db;

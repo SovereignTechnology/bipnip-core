@@ -85,6 +85,8 @@ pub struct RingOrder {
     pub announce: bool,
     /// Seconds members have to open once the roster is fixed.
     pub open_window_secs: u64,
+    /// What each member locks at the instance until the ring ends, in satoshi; 0 for none.
+    pub bond_sat: u64,
     /// Unix seconds after which open slots can no longer be taken.
     pub expires_at: u64,
 }
@@ -142,6 +144,7 @@ impl RingOrder {
             taken,
             announce: offer.announce,
             open_window_secs: offer.open_window_secs,
+            bond_sat: offer.bond_sat,
             expires_at: offer.expires_at,
         };
         order.validate()?;
@@ -155,6 +158,7 @@ impl RingOrder {
             capacity_sat: self.capacity_sat,
             announce: self.announce,
             open_window_secs: self.open_window_secs,
+            bond_sat: self.bond_sat,
         }
     }
 
@@ -194,6 +198,7 @@ impl RingOrder {
             one("capacity", self.capacity_sat.to_string()),
             one("announce", self.announce.to_string()),
             one("window", self.open_window_secs.to_string()),
+            one("bond", self.bond_sat.to_string()),
             one("expiration", self.expires_at.to_string()),
         ])
     }
@@ -232,6 +237,7 @@ impl RingOrder {
             taken: num(&slots[1], "slots")?,
             announce,
             open_window_secs: num(&tag_values(event, "window", 1)?[0], "window")?,
+            bond_sat: num(&tag_values(event, "bond", 1)?[0], "bond")?,
             expires_at: num(&tag_values(event, "expiration", 1)?[0], "expiration")?,
         };
         order.validate()?;
@@ -262,6 +268,7 @@ mod tests {
             slots: 4,
             announce: true,
             open_window_secs: 48 * 3_600,
+            bond_sat: 0,
             expires_at: 1_794_886_400,
             seat: RingSeat {
                 node: node().to_string(),
@@ -370,6 +377,32 @@ mod tests {
     }
 
     #[test]
+    fn the_bond_is_published_with_the_order() {
+        let mut bonded = offer();
+        bonded.bond_sat = 50_000;
+        let order =
+            RingOrder::from_offer(order().id, RingOrderStatus::Pending, 1, &bonded).expect("order");
+        assert_eq!(order.bond_sat, 50_000);
+        assert_eq!(order.terms(), bonded.terms());
+        let event = order
+            .to_event_builder()
+            .finalize(&Keys::generate())
+            .expect("signs");
+        assert_eq!(RingOrder::from_event(&event), Ok(order));
+        // A bond on a ring of unannounced channels is not an order an instance may publish.
+        bonded.announce = false;
+        assert!(RingOrder::from_offer(order_id(), RingOrderStatus::Pending, 1, &bonded).is_err());
+        // An order without the tag is from another version, and is refused.
+        let mut missing = tags(&self::order());
+        missing.retain(|t| t[0] != "bond");
+        assert!(RingOrder::from_event(&signed(KIND_LEASE_ORDER, missing)).is_err());
+    }
+
+    fn order_id() -> Uuid {
+        order().id
+    }
+
+    #[test]
     fn orders_out_of_range_are_refused() {
         let id = order().id;
         let pending = RingOrderStatus::Pending;
@@ -405,7 +438,10 @@ mod tests {
             ("capacity", vec!["1"]),
             ("capacity", vec!["2000000", "5000000"]),
             ("announce", vec!["yes"]),
-            ("window", vec!["60"]),
+            ("bond", vec!["050000"]),
+            ("bond", vec!["-1"]),
+            ("bond", vec![]),
+            ("window", vec!["59"]),
             ("window", vec!["+172800"]),
             ("expiration", vec!["0"]),
             ("expiration", vec![]),

@@ -300,6 +300,23 @@ pub enum Action {
     /// confirmed. Direction: instance → every member.
     /// Payload: [`Payload::Ring`] ([`RingPayload::Closed`]).
     RingClosed,
+    /// bipnip: the instance's hold invoice for a member's ring bond.
+    /// Direction: instance → member.
+    /// Payload: [`Payload::Ring`] ([`RingPayload::Invoice`]).
+    RingBondInvoice,
+    /// bipnip: a member that is owed a slashed ring bond sends its invoice
+    /// for it. Direction: member → instance.
+    /// Payload: [`Payload::Ring`] ([`RingPayload::Invoice`]).
+    RingBondClaim,
+    /// bipnip: the instance's hold invoice for a lease buyer's bond.
+    /// Direction: instance → buyer.
+    /// Payload: [`Payload::Lease`] ([`LeasePayload::Invoice`]).
+    LeaseBondInvoice,
+    /// bipnip: a slashed buyer bond. Direction: instance → seller with no
+    /// payload ("you are owed the bond"), then seller → instance with its
+    /// invoice. Payload: `None`, or [`Payload::Lease`]
+    /// ([`LeasePayload::Invoice`]).
+    LeaseBondClaim,
 }
 
 impl fmt::Display for Action {
@@ -1077,7 +1094,9 @@ impl MessageKind {
             | Action::LeaseChannelOpened
             | Action::LeasePreimage
             | Action::LeaseActive
-            | Action::LeaseCompletionInvoice => crate::lease_message::shape_ok(
+            | Action::LeaseCompletionInvoice
+            | Action::LeaseBondInvoice
+            | Action::LeaseBondClaim => crate::lease_message::shape_ok(
                 &self.action,
                 self.id.is_some(),
                 self.payload.as_ref(),
@@ -1089,7 +1108,9 @@ impl MessageKind {
             | Action::RingOpen
             | Action::RingEdgeOpened
             | Action::RingEdgeVerified
-            | Action::RingClosed => crate::ring_message::shape_ok(
+            | Action::RingClosed
+            | Action::RingBondInvoice
+            | Action::RingBondClaim => crate::ring_message::shape_ok(
                 &self.action,
                 self.id.is_some(),
                 self.payload.as_ref(),
@@ -1469,7 +1490,11 @@ mod test {
             | Action::RingOpen
             | Action::RingEdgeOpened
             | Action::RingEdgeVerified
-            | Action::RingClosed => {}
+            | Action::RingClosed
+            | Action::RingBondInvoice
+            | Action::RingBondClaim
+            | Action::LeaseBondInvoice
+            | Action::LeaseBondClaim => {}
         };
 
         let other_actions: &[Action] = &[
@@ -1546,6 +1571,10 @@ mod test {
             Action::RingEdgeOpened,
             Action::RingEdgeVerified,
             Action::RingClosed,
+            Action::RingBondInvoice,
+            Action::RingBondClaim,
+            Action::LeaseBondInvoice,
+            Action::LeaseBondClaim,
         ];
 
         for action in other_actions {
