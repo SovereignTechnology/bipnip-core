@@ -11,6 +11,8 @@
 //! | `ring-edge-opened` | opener → instance → the member it opened to | [`RingPayload::Edge`] |
 //! | `ring-edge-verified` | receiver → instance → the opener | [`RingPayload::Edge`] |
 //! | `ring-closed` | instance → every member, at the end | [`RingPayload::Closed`] |
+//! | `ring-bond-invoice` | instance → each member of a ring with bonds, after the commits | [`RingPayload::Invoice`] |
+//! | `ring-bond-claim` | a member that is owed a bond → instance | [`RingPayload::Invoice`] |
 //!
 //! What a member does not take on the instance's word:
 //!
@@ -23,9 +25,11 @@
 //! - **That a channel exists.** `ring-edge-opened` only says where to look; the receiving
 //!   member's own node is the judge.
 //!
-//! This first version has no bonds: a member that never opens costs the others nothing but the
-//! channel they opened, which stands. Unknown fields are refused, so a bond field added later is
-//! not silently ignored by this version.
+//! A ring may ask for a bond ([`crate::ring::RingTerms::bond_sat`]): each member locks that
+//! much at the instance's node before anyone opens. All bonds go back when every channel is
+//! there. A member whose channel is missing when the window ends loses its bond to the member it
+//! should have opened to. The instance decides that on what its own node's graph shows, which is
+//! why a bond needs announced channels; a member's word cannot take another member's bond.
 //!
 //! Everything here is pure: no node, no relay, no clock (callers pass `now`).
 
@@ -37,7 +41,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::lease_message::{
-    check_binding, valid_node_address, LeaseMessageError, MAX_BINDING_JSON_LEN,
+    check_binding, valid_invoice_shape, valid_node_address, LeaseMessageError, MAX_BINDING_JSON_LEN,
 };
 use crate::message::{Action, Message, Payload};
 use crate::node_binding::Network;
@@ -182,6 +186,8 @@ pub struct RingOffer {
     pub announce: bool,
     /// Seconds members have to open once the roster is fixed.
     pub open_window_secs: u64,
+    /// What each member locks at the instance until the ring ends, in satoshi; 0 for none.
+    pub bond_sat: u64,
     /// Unix seconds after which the open slots can no longer be taken.
     pub expires_at: u64,
     /// The creator's own seat.
@@ -196,6 +202,7 @@ impl RingOffer {
             capacity_sat: self.capacity_sat,
             announce: self.announce,
             open_window_secs: self.open_window_secs,
+            bond_sat: self.bond_sat,
         }
     }
 
@@ -491,7 +498,32 @@ impl RingEdge {
     }
 }
 
-/// How the ring ended: which members' channels the member they opened to confirmed.
+/// A BOLT 11 invoice tied to a ring: the instance's hold invoice for a member's bond
+/// (`ring-bond-invoice`), or a member's invoice for a bond it is owed (`ring-bond-claim`). The
+/// receiver checks the invoice itself before paying; nothing here vouches for it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RingInvoice {
+    /// The ring id.
+    pub ring_id: String,
+    /// The BOLT 11 invoice.
+    pub invoice: String,
+}
+
+impl RingInvoice {
+    /// Checks the id's form and the invoice's shape.
+    pub fn validate(&self) -> Result<(), RingMessageError> {
+        if !is_lower_hex(&self.ring_id, 64) {
+            return Err(field("ring_id"));
+        }
+        if !valid_invoice_shape(&self.invoice) {
+            return Err(field("invoice"));
+        }
+        Ok(())
+    }
+}
+
+/// How the ring ended: which members' channels were confirmed, and whose bond was taken.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RingClosed {
@@ -500,6 +532,10 @@ pub struct RingClosed {
     /// Positions (from 0, in opening order) of the members whose channel was confirmed, in
     /// ascending order.
     pub verified: Vec<u8>,
+    /// Positions of the members whose bond was taken because their channel was missing, in
+    /// ascending order. Empty for a ring without bonds. Each of these bonds is owed to the next
+    /// member.
+    pub slashed: Vec<u8>,
 }
 
 impl RingClosed {
@@ -509,13 +545,19 @@ impl RingClosed {
         if !is_lower_hex(&self.ring_id, 64) {
             return Err(field("ring_id"));
         }
-        let ascending = self.verified.windows(2).all(|pair| pair[0] < pair[1]);
-        let in_range = self
-            .verified
-            .iter()
-            .all(|position| usize::from(*position) < MAX_RING_SIZE);
-        if !ascending || !in_range {
+        let well_formed = |positions: &[u8]| {
+            positions.windows(2).all(|pair| pair[0] < pair[1])
+                && positions
+                    .iter()
+                    .all(|position| usize::from(*position) < MAX_RING_SIZE)
+        };
+        if !well_formed(&self.verified) {
             return Err(field("verified"));
+        }
+        // A member whose channel was confirmed keeps its bond.
+        let both = self.slashed.iter().any(|p| self.verified.contains(p));
+        if !well_formed(&self.slashed) || both {
+            return Err(field("slashed"));
         }
         Ok(())
     }
@@ -529,13 +571,32 @@ impl RingClosed {
         if self
             .verified
             .iter()
+            .chain(&self.slashed)
             .any(|position| usize::from(*position) >= ring.members.len())
         {
             return Err(RingMessageError::Mismatch(
                 "a position the ring does not have",
             ));
         }
+        if !self.slashed.is_empty() && ring.terms.bond_sat == 0 {
+            return Err(RingMessageError::Mismatch(
+                "a bond taken in a ring without bonds",
+            ));
+        }
         Ok(())
+    }
+
+    /// True when the member at `position` is owed a bond: the member before it, which should
+    /// have opened a channel to it, lost its own.
+    pub fn owed_a_bond(&self, ring: &Ring, position: usize) -> bool {
+        let n = ring.members.len();
+        if n == 0 || position >= n {
+            return false;
+        }
+        let before = (position + n - 1) % n;
+        self.slashed
+            .iter()
+            .any(|slashed| usize::from(*slashed) == before)
     }
 
     /// True when every member's channel was confirmed.
@@ -562,6 +623,8 @@ pub enum RingPayload {
     Edge(RingEdge),
     /// With [`Action::RingClosed`].
     Closed(RingClosed),
+    /// With [`Action::RingBondInvoice`] and [`Action::RingBondClaim`].
+    Invoice(RingInvoice),
 }
 
 impl RingPayload {
@@ -575,6 +638,7 @@ impl RingPayload {
             RingPayload::Open(open) => open.validate(),
             RingPayload::Edge(edge) => edge.validate(),
             RingPayload::Closed(closed) => closed.validate(),
+            RingPayload::Invoice(invoice) => invoice.validate(),
         }
     }
 }
@@ -591,6 +655,8 @@ pub fn is_ring_action(action: &Action) -> bool {
             | Action::RingEdgeOpened
             | Action::RingEdgeVerified
             | Action::RingClosed
+            | Action::RingBondInvoice
+            | Action::RingBondClaim
     )
 }
 
@@ -611,6 +677,9 @@ pub fn shape_ok(action: &Action, has_id: bool, payload: Option<&Payload>) -> boo
             has_id && matches!(ring, RingPayload::Edge(_))
         }
         Action::RingClosed => has_id && matches!(ring, RingPayload::Closed(_)),
+        Action::RingBondInvoice | Action::RingBondClaim => {
+            has_id && matches!(ring, RingPayload::Invoice(_))
+        }
         _ => false,
     }
 }
@@ -688,6 +757,7 @@ mod tests {
             slots,
             announce: true,
             open_window_secs: 48 * 3_600,
+            bond_sat: 0,
             expires_at: NOW + 86_400,
             seat: creator.seat(),
         }
@@ -757,7 +827,7 @@ mod tests {
             Err(RingMessageError::Ring(RingError::Term("capacity_sat")))
         ));
         assert!(matches!(
-            with(&|o| o.open_window_secs = 60),
+            with(&|o| o.open_window_secs = 59),
             Err(RingMessageError::Ring(RingError::Term("open_window_secs")))
         ));
         assert_eq!(with(&|o| o.seat.node = "02ab".into()), Err(field("node")));
@@ -988,6 +1058,7 @@ mod tests {
         let closed = |verified: Vec<u8>| RingClosed {
             ring_id: ring.id(),
             verified,
+            slashed: vec![],
         };
         let all = closed(vec![0, 1, 2]);
         all.check(&ring).unwrap();
@@ -1013,6 +1084,55 @@ mod tests {
             other.check(&ring),
             Err(RingMessageError::Mismatch("another ring id"))
         );
+
+        // Bonds taken: only in a ring that has bonds, never from a member whose channel was
+        // confirmed, and each one is owed to the next member.
+        let taken = |verified: Vec<u8>, slashed: Vec<u8>| RingClosed {
+            ring_id: ring.id(),
+            verified,
+            slashed,
+        };
+        assert_eq!(
+            taken(vec![0, 1], vec![2]).check(&ring),
+            Err(RingMessageError::Mismatch(
+                "a bond taken in a ring without bonds"
+            ))
+        );
+        let mut bonded = ring.clone();
+        bonded.terms.bond_sat = 50_000;
+        let report = RingClosed {
+            ring_id: bonded.id(),
+            verified: vec![0, 1],
+            slashed: vec![2],
+        };
+        report.check(&bonded).unwrap();
+        assert!(!report.is_complete(&bonded));
+        // Member 2 never opened to member 0: member 0 is owed, nobody else.
+        assert!(report.owed_a_bond(&bonded, 0));
+        assert!(!report.owed_a_bond(&bonded, 1));
+        assert!(!report.owed_a_bond(&bonded, 2));
+        assert!(!report.owed_a_bond(&bonded, 7));
+        assert_eq!(taken(vec![0, 1], vec![1]).validate(), Err(field("slashed")));
+        assert_eq!(taken(vec![0], vec![2, 1]).validate(), Err(field("slashed")));
+        assert_eq!(taken(vec![0], vec![5]).validate(), Err(field("slashed")));
+        let beyond = RingClosed {
+            ring_id: bonded.id(),
+            verified: vec![0],
+            slashed: vec![3],
+        };
+        assert!(beyond.check(&bonded).is_err());
+
+        let invoice = RingInvoice {
+            ring_id: ring.id(),
+            invoice: format!("lnbcrt500u1{}", "q".repeat(200)),
+        };
+        invoice.validate().unwrap();
+        let mut junk = invoice.clone();
+        junk.invoice = "not an invoice".into();
+        assert_eq!(junk.validate(), Err(field("invoice")));
+        let mut short = invoice;
+        short.ring_id = "ab".into();
+        assert_eq!(short.validate(), Err(field("ring_id")));
     }
 
     /// Every ring action with the payload it carries.
@@ -1025,6 +1145,10 @@ mod tests {
             ring_id: ring.id(),
             funding_txid: "cd".repeat(32),
             output_index: 0,
+        };
+        let bond = RingInvoice {
+            ring_id: ring.id(),
+            invoice: format!("lnbcrt500u1{}", "q".repeat(200)),
         };
         vec![
             (Action::RingOffer, RingPayload::Offer(offer)),
@@ -1042,8 +1166,11 @@ mod tests {
                 RingPayload::Closed(RingClosed {
                     ring_id: ring.id(),
                     verified: vec![0, 1, 2],
+                    slashed: vec![],
                 }),
             ),
+            (Action::RingBondInvoice, RingPayload::Invoice(bond.clone())),
+            (Action::RingBondClaim, RingPayload::Invoice(bond)),
         ]
     }
 
@@ -1087,12 +1214,13 @@ mod tests {
         // Each action takes its own payload and no other action's.
         for (action, _) in &all {
             for (other_action, payload) in &all {
-                let same_payload_kind = action == other_action
-                    || (matches!(action, Action::RingEdgeOpened | Action::RingEdgeVerified)
-                        && matches!(
-                            other_action,
-                            Action::RingEdgeOpened | Action::RingEdgeVerified
-                        ));
+                let pair = |a: &Action, b: &Action| {
+                    matches!(a, Action::RingEdgeOpened | Action::RingEdgeVerified)
+                        && matches!(b, Action::RingEdgeOpened | Action::RingEdgeVerified)
+                        || matches!(a, Action::RingBondInvoice | Action::RingBondClaim)
+                            && matches!(b, Action::RingBondInvoice | Action::RingBondClaim)
+                };
+                let same_payload_kind = action == other_action || pair(action, other_action);
                 let message = Message::new_order(
                     id,
                     None,
@@ -1132,12 +1260,12 @@ mod tests {
         let ms = members(2);
         let seat = serde_json::to_value(ms[0].seat()).unwrap();
         let mut extra = seat.clone();
-        extra["bond_sat"] = serde_json::json!(1000);
+        extra["alias"] = serde_json::json!("a node");
         assert!(serde_json::from_value::<RingSeat>(seat).is_ok());
         assert!(serde_json::from_value::<RingSeat>(extra).is_err());
 
         let mut offer = serde_json::to_value(offer(&ms[0], 2)).unwrap();
-        offer["bond_sat"] = serde_json::json!(1000);
+        offer["rules"] = serde_json::json!("min_channels=3");
         assert!(serde_json::from_value::<RingOffer>(offer).is_err());
 
         let mut edge = serde_json::json!({

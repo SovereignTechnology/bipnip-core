@@ -11,6 +11,8 @@
 //! | `lease-preimage` | buyer → seller, peer to peer, never through the instance | [`LeasePayload::Preimage`] |
 //! | `lease-active` | seller → instance → buyer | none |
 //! | `lease-completion-invoice` | seller → instance → buyer | [`LeasePayload::Invoice`] |
+//! | `lease-bond-invoice` | instance → buyer, when the offer asks for a bond | [`LeasePayload::Invoice`] |
+//! | `lease-bond-claim` | instance → seller (none: "you are owed the bond"); seller → instance (its invoice) | none, or [`LeasePayload::Invoice`] |
 //!
 //! Only bipnip agents and instances send or understand these; upstream Mostro software refuses
 //! them as unknown actions. Unknown fields are refused too: a party that does not understand part
@@ -142,7 +144,7 @@ pub(crate) fn valid_node_address(s: &str) -> bool {
 
 /// BOLT 11 shape only (`ln…`, bech32 characters, bounded length). The buyer's agent parses and
 /// checks the invoice itself before paying; this only keeps junk out of the pipeline.
-fn valid_invoice_shape(s: &str) -> bool {
+pub(crate) fn valid_invoice_shape(s: &str) -> bool {
     s.len() <= MAX_INVOICE_LEN
         && s.len() > 20
         && s.starts_with("ln")
@@ -216,6 +218,11 @@ pub struct LeaseOffer {
     pub announce: bool,
     /// Unix seconds after which the offer can no longer be taken.
     pub expires_at: u64,
+    /// What the buyer locks at the instance while the lease is set up, in satoshi; 0 for none.
+    /// It goes to the seller if the seller's channel shows in the instance's graph and the buyer
+    /// never released the preimage. Needs an announced channel: the instance takes a bond only
+    /// on what its own node can see.
+    pub bond_sat: u64,
 }
 
 impl LeaseOffer {
@@ -243,6 +250,11 @@ impl LeaseOffer {
         }
         if self.expires_at == 0 {
             return Err(LeaseMessageError::Field("expires_at"));
+        }
+        let bond_ok = crate::bond::bond_amount_ok(self.bond_sat)
+            && (self.bond_sat == 0 || (self.announce && self.bond_sat <= self.min_capacity_sat));
+        if !bond_ok {
+            return Err(LeaseMessageError::Field("bond_sat"));
         }
         Ok(())
     }
@@ -501,6 +513,8 @@ pub fn is_lease_action(action: &Action) -> bool {
             | Action::LeasePreimage
             | Action::LeaseActive
             | Action::LeaseCompletionInvoice
+            | Action::LeaseBondInvoice
+            | Action::LeaseBondClaim
     )
 }
 
@@ -516,9 +530,12 @@ pub fn shape_ok(action: &Action, has_id: bool, payload: Option<&Payload>) -> boo
     match action {
         Action::LeaseOffer => matches!(lease, Some(LeasePayload::Offer(_))),
         Action::TakeLease => has_id && matches!(lease, Some(LeasePayload::Take(_))),
-        Action::LeaseInvoice | Action::LeaseCompletionInvoice => {
+        Action::LeaseInvoice | Action::LeaseCompletionInvoice | Action::LeaseBondInvoice => {
             has_id && matches!(lease, Some(LeasePayload::Invoice(_)))
         }
+        // Without a payload it is the instance telling the seller it is owed the bond; with an
+        // invoice it is the seller's claim.
+        Action::LeaseBondClaim => has_id && matches!(lease, None | Some(LeasePayload::Invoice(_))),
         Action::LeaseChannelOpened => has_id && matches!(lease, Some(LeasePayload::Channel(_))),
         Action::LeasePreimage => has_id && matches!(lease, Some(LeasePayload::Preimage(_))),
         Action::LeaseActive => has_id && lease.is_none(),
@@ -587,6 +604,7 @@ mod tests {
             min_confirmations: 3,
             announce: true,
             expires_at: NOW + 86_400,
+            bond_sat: 0,
         }
     }
 
@@ -1017,6 +1035,8 @@ mod tests {
             (Action::LeasePreimage, "lease-preimage"),
             (Action::LeaseActive, "lease-active"),
             (Action::LeaseCompletionInvoice, "lease-completion-invoice"),
+            (Action::LeaseBondInvoice, "lease-bond-invoice"),
+            (Action::LeaseBondClaim, "lease-bond-claim"),
         ] {
             assert!(is_lease_action(&action));
             assert_eq!(
@@ -1065,6 +1085,7 @@ mod tests {
             (Action::TakeLease, Some(1)),
             (Action::LeaseInvoice, Some(2)),
             (Action::LeaseCompletionInvoice, Some(2)),
+            (Action::LeaseBondInvoice, Some(2)),
             (Action::LeaseChannelOpened, Some(3)),
             (Action::LeasePreimage, Some(4)),
             (Action::LeaseActive, None),
@@ -1089,6 +1110,36 @@ mod tests {
                 "{action:?} without an id"
             );
         }
+        // The bond claim travels both ways: without a payload it tells the seller it is owed
+        // the bond; with an invoice it is the seller's claim. Nothing else fits it.
+        for (i, payload) in payloads.iter().enumerate() {
+            let with = kind(
+                &Action::LeaseBondClaim,
+                true,
+                Some(Payload::Lease(payload.clone())),
+            );
+            assert_eq!(with.verify(), i == 2, "lease-bond-claim with {i}");
+        }
+        assert!(kind(&Action::LeaseBondClaim, true, None).verify());
+        assert!(!kind(&Action::LeaseBondClaim, false, None).verify());
+
+        // A bond needs an announced channel and cannot exceed the smallest channel on offer.
+        let mut bonded = o.clone();
+        bonded.bond_sat = 50_000;
+        assert_eq!(bonded.validate(), Ok(()));
+        let mut private = bonded.clone();
+        private.announce = false;
+        assert_eq!(
+            private.validate(),
+            Err(LeaseMessageError::Field("bond_sat"))
+        );
+        let mut huge = bonded.clone();
+        huge.bond_sat = huge.min_capacity_sat + 1;
+        assert_eq!(huge.validate(), Err(LeaseMessageError::Field("bond_sat")));
+        let mut dust = bonded.clone();
+        dust.bond_sat = crate::bond::MIN_BOND_SAT - 1;
+        assert_eq!(dust.validate(), Err(LeaseMessageError::Field("bond_sat")));
+
         // Upstream actions refuse a lease payload.
         for action in [
             Action::Release,

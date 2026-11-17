@@ -92,6 +92,8 @@ pub struct LeaseOrder {
     pub announce: bool,
     /// Unix seconds after which the order can no longer be taken.
     pub expires_at: u64,
+    /// The bond the buyer locks at the instance while the lease is set up, in satoshi; 0 for none.
+    pub bond_sat: u64,
 }
 
 fn field(what: &'static str) -> LeaseMessageError {
@@ -150,6 +152,7 @@ impl LeaseOrder {
             min_confirmations: offer.min_confirmations,
             announce: offer.announce,
             expires_at: offer.expires_at,
+            bond_sat: offer.bond_sat,
         })
     }
 
@@ -178,6 +181,11 @@ impl LeaseOrder {
         self.terms_unchecked(self.max_capacity_sat).validate()?;
         if self.expires_at == 0 {
             return Err(field("expires_at"));
+        }
+        let bond_ok = crate::bond::bond_amount_ok(self.bond_sat)
+            && (self.bond_sat == 0 || (self.announce && self.bond_sat <= self.min_capacity_sat));
+        if !bond_ok {
+            return Err(field("bond"));
         }
         Ok(())
     }
@@ -222,6 +230,7 @@ impl LeaseOrder {
             one("split", self.upfront_percent.to_string()),
             one("confs", self.min_confirmations.to_string()),
             one("announce", self.announce.to_string()),
+            one("bond", self.bond_sat.to_string()),
             one("expiration", self.expires_at.to_string()),
         ])
     }
@@ -273,6 +282,7 @@ impl LeaseOrder {
             min_confirmations: num(&tag_values(event, "confs", 1)?[0], "confs")?,
             announce,
             expires_at: num(&tag_values(event, "expiration", 1)?[0], "expiration")?,
+            bond_sat: num(&tag_values(event, "bond", 1)?[0], "bond")?,
         };
         order.validate()?;
         Ok(order)
@@ -308,6 +318,7 @@ mod tests {
             min_confirmations: 3,
             announce: true,
             expires_at: 1_794_886_400,
+            bond_sat: 0,
         }
     }
 
@@ -391,6 +402,7 @@ mod tests {
             vec!["split", "50"],
             vec!["confs", "3"],
             vec!["announce", "true"],
+            vec!["bond", "0"],
             vec!["expiration", "1794886400"],
         ]
         .into_iter()
@@ -422,6 +434,35 @@ mod tests {
         bad.upfront_percent = 0;
         let id = Uuid::new_v4();
         assert!(LeaseOrder::from_offer(id, LeaseOrderStatus::Pending, &bad).is_err());
+    }
+
+    #[test]
+    fn the_bond_is_published_with_the_order() {
+        let mut bonded = offer();
+        bonded.bond_sat = 50_000;
+        let order =
+            LeaseOrder::from_offer(order().id, LeaseOrderStatus::Pending, &bonded).expect("order");
+        assert_eq!(order.bond_sat, 50_000);
+        let event = order
+            .to_event_builder()
+            .finalize(&Keys::generate())
+            .expect("signs");
+        assert_eq!(LeaseOrder::from_event(&event), Ok(order.clone()));
+        // A bond on an unannounced channel is refused, in an offer and in an event.
+        let private = LeaseOrder {
+            announce: false,
+            ..order
+        };
+        assert!(private.validate().is_err());
+        let event = private
+            .to_event_builder()
+            .finalize(&Keys::generate())
+            .expect("signs");
+        assert!(LeaseOrder::from_event(&event).is_err());
+        // An order without the tag is from another version, and is refused.
+        let mut missing = tags(&self::order());
+        missing.retain(|t| t[0] != "bond");
+        assert!(LeaseOrder::from_event(&signed(KIND_LEASE_ORDER, missing)).is_err());
     }
 
     #[test]
