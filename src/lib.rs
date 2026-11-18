@@ -92,6 +92,7 @@ pub mod lease_order;
 pub mod message;
 pub mod node_binding;
 pub mod order;
+pub mod outcome;
 pub mod payer;
 pub mod prelude;
 pub mod rating;
