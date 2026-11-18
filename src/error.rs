@@ -142,6 +142,14 @@ pub enum CantDoReason {
     /// The source account, or another account from the same issuer for this
     /// identity, was imported before.
     ReputationAlreadyImported,
+    /// bipnip: the taker's node does not meet the liquidity order's rules in
+    /// this instance's graph.
+    RulesNotMet,
+    /// bipnip: this instance's graph does not know the node, and the order
+    /// needs one it can see.
+    NodeNotInGraph,
+    /// bipnip: the node's newest binding statement revokes the binding sent.
+    BindingRevoked,
     /// Catch-all for reasons this build of `mostro-core` does not know yet.
     ///
     /// Newer daemons may emit reasons added after this release; without this
@@ -433,6 +441,9 @@ mod tests {
                 CantDoReason::ReputationAlreadyImported,
                 "reputation_already_imported",
             ),
+            (CantDoReason::RulesNotMet, "rules_not_met"),
+            (CantDoReason::NodeNotInGraph, "node_not_in_graph"),
+            (CantDoReason::BindingRevoked, "binding_revoked"),
         ];
         for (reason, wire) in reasons {
             let json = serde_json::to_string(&reason).unwrap();

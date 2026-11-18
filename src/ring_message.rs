@@ -46,6 +46,7 @@ use crate::lease_message::{
 use crate::message::{Action, Message, Payload};
 use crate::node_binding::Network;
 use crate::ring::{Ring, RingError, RingTerms, MAX_RING_SIZE, MIN_RING_SIZE};
+use crate::rules::Rules;
 
 /// Why a ring message was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -192,6 +193,10 @@ pub struct RingOffer {
     pub expires_at: u64,
     /// The creator's own seat.
     pub seat: RingSeat,
+    /// What every member's node must show in the public graph ([`Rules`]). Absent when none is
+    /// set.
+    #[serde(default, skip_serializing_if = "Rules::is_none")]
+    pub rules: Rules,
 }
 
 impl RingOffer {
@@ -203,6 +208,7 @@ impl RingOffer {
             announce: self.announce,
             open_window_secs: self.open_window_secs,
             bond_sat: self.bond_sat,
+            rules: self.rules,
         }
     }
 
@@ -760,6 +766,7 @@ mod tests {
             bond_sat: 0,
             expires_at: NOW + 86_400,
             seat: creator.seat(),
+            rules: Rules::default(),
         }
     }
 
@@ -1276,5 +1283,21 @@ mod tests {
         assert!(serde_json::from_value::<RingEdge>(edge.clone()).is_ok());
         edge["note"] = serde_json::json!("x");
         assert!(serde_json::from_value::<RingEdge>(edge).is_err());
+    }
+
+    #[test]
+    fn a_roster_must_carry_the_offers_rules() {
+        let members = members(2);
+        let mut strict = offer(&members[0], 2);
+        strict.rules.min_channels = 1;
+        assert_eq!(strict.terms().rules, strict.rules);
+        let mut without = Ring {
+            terms: strict.terms(),
+            members: members.iter().map(Member::node_key).collect(),
+            created_at: NOW,
+        };
+        assert!(strict.check_ring(&without).is_ok());
+        without.terms.rules = Rules::default();
+        assert!(strict.check_ring(&without).is_err());
     }
 }

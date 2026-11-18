@@ -17,6 +17,7 @@ use sha2::{Digest, Sha256};
 
 use crate::lease::{MAX_CAPACITY_SAT, MIN_CAPACITY_SAT};
 use crate::node_binding::Network;
+use crate::rules::Rules;
 
 /// Fewest members a ring may have: two nodes opening a channel to each other.
 pub const MIN_RING_SIZE: usize = 2;
@@ -67,6 +68,8 @@ pub struct RingTerms {
     /// What each member locks at the instance until the ring ends, in satoshi; 0 for none. A
     /// member whose channel is missing when the window ends loses it to the member it failed.
     pub bond_sat: u64,
+    /// What every member's node must show in the public graph ([`Rules`]).
+    pub rules: Rules,
 }
 
 impl RingTerms {
@@ -95,6 +98,9 @@ impl RingTerms {
                 return Err(RingError::Term("bond_sat"));
             }
         }
+        self.rules
+            .validate()
+            .map_err(|_| RingError::Term("rules"))?;
         Ok(())
     }
 }
@@ -141,24 +147,46 @@ impl Ring {
         Ok(())
     }
 
-    /// The canonical text (ASCII, no spaces; members separated by commas, in opening order):
+    /// The canonical text (ASCII, no spaces; members separated by commas, in opening order).
+    /// A ring with no [`Rules`]:
     ///
     /// ```text
     /// bipnip-ring:v1:<network>:<capacity_sat>:<announce 0|1>:<open_window_secs>:<bond_sat>:
     /// <created_at>:<node 1>,<node 2>,…,<node N>
     /// ```
+    ///
+    /// and one with rules, which every member's commit then covers too:
+    ///
+    /// ```text
+    /// bipnip-ring:v2:<network>:<capacity_sat>:<announce 0|1>:<open_window_secs>:<bond_sat>:
+    /// <min_channels>:<min_capacity_sat>:<created_at>:<node 1>,<node 2>,…,<node N>
+    /// ```
     pub fn text(&self) -> String {
         let members: Vec<String> = self.members.iter().map(ToString::to_string).collect();
-        format!(
-            "bipnip-ring:v1:{}:{}:{}:{}:{}:{}:{}",
+        let terms = format!(
+            "{}:{}:{}:{}:{}",
             self.terms.network.as_str(),
             self.terms.capacity_sat,
             u8::from(self.terms.announce),
             self.terms.open_window_secs,
             self.terms.bond_sat,
-            self.created_at,
-            members.join(",")
-        )
+        );
+        let rules = &self.terms.rules;
+        if rules.is_none() {
+            format!(
+                "bipnip-ring:v1:{terms}:{}:{}",
+                self.created_at,
+                members.join(",")
+            )
+        } else {
+            format!(
+                "bipnip-ring:v2:{terms}:{}:{}:{}:{}",
+                rules.min_channels,
+                rules.min_capacity_sat,
+                self.created_at,
+                members.join(",")
+            )
+        }
     }
 
     /// The ring id: SHA-256 of the canonical text, lower-case hex.
@@ -173,9 +201,22 @@ impl Ring {
     /// parsed values, or failing [`Ring::validate`], is rejected.
     pub fn parse(text: &str) -> Result<Self, RingError> {
         let f: Vec<&str> = text.split(':').collect();
-        if f.len() != 9 || f[0] != "bipnip-ring" || f[1] != "v1" {
-            return Err(RingError::Roster("header"));
-        }
+        let with_rules = match (f.first(), f.get(1), f.len()) {
+            (Some(&"bipnip-ring"), Some(&"v1"), 9) => false,
+            (Some(&"bipnip-ring"), Some(&"v2"), 11) => true,
+            _ => return Err(RingError::Roster("header")),
+        };
+        // v2 carries the two rules before `created_at`; both kinds end the same way.
+        let (rules, rest) = if with_rules {
+            let rules = Rules {
+                min_channels: u32::try_from(parse_num(f[7], "min_channels")?)
+                    .map_err(|_| RingError::Roster("min_channels"))?,
+                min_capacity_sat: parse_num(f[8], "min_capacity_sat")?,
+            };
+            (rules, &f[9..])
+        } else {
+            (Rules::default(), &f[7..])
+        };
         let network = f[2]
             .parse::<Network>()
             .map_err(|_| RingError::Roster("network"))?;
@@ -185,7 +226,7 @@ impl Ring {
             _ => return Err(RingError::Roster("announce")),
         };
         let mut members = Vec::new();
-        for node in f[8].split(',') {
+        for node in rest[1].split(',') {
             if !is_lower_hex(node, 66) {
                 return Err(RingError::Roster("member"));
             }
@@ -198,9 +239,10 @@ impl Ring {
                 announce,
                 open_window_secs: parse_num(f[5], "open_window_secs")?,
                 bond_sat: parse_num(f[6], "bond_sat")?,
+                rules,
             },
             members,
-            created_at: parse_num(f[7], "created_at")?,
+            created_at: parse_num(rest[0], "created_at")?,
         };
         ring.validate()?;
         if ring.text() != text {
@@ -253,6 +295,7 @@ mod tests {
                 announce: true,
                 open_window_secs: 48 * 3_600,
                 bond_sat: 0,
+                rules: Rules::default(),
             },
             members: (1..=size).map(node).collect(),
             created_at: 1_794_800_000,
@@ -457,5 +500,35 @@ mod tests {
             }
             assert!(Ring::parse(&candidate).is_err(), "{candidate}");
         }
+    }
+
+    #[test]
+    fn a_ring_with_rules_has_a_v2_text_that_names_them() {
+        let plain = ring(3);
+        assert!(plain.text().starts_with("bipnip-ring:v1:"));
+        let mut strict = ring(3);
+        strict.terms.rules = Rules {
+            min_channels: 2,
+            min_capacity_sat: 0,
+        };
+        let text = strict.text();
+        assert!(
+            text.starts_with("bipnip-ring:v2:regtest:2000000:1:172800:0:2:0:1794800000:"),
+            "{text}"
+        );
+        assert_eq!(Ring::parse(&text), Ok(strict.clone()));
+        // The rules are part of what every member signs.
+        assert_ne!(strict.id(), plain.id());
+        // No rules written as v2, or rules written as v1: not canonical.
+        let as_v2 = plain.text().replacen(":v1:", ":v2:", 1).replacen(
+            ":1794800000:",
+            ":0:0:1794800000:",
+            1,
+        );
+        assert!(Ring::parse(&as_v2).is_err());
+        assert!(Ring::parse(&text.replacen(":v2:", ":v1:", 1)).is_err());
+        // Out of range.
+        let wild = text.replacen(":2:0:1794800000:", ":99999:0:1794800000:", 1);
+        assert!(Ring::parse(&wild).is_err());
     }
 }

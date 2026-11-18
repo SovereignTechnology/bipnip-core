@@ -18,6 +18,7 @@ use uuid::Uuid;
 use crate::lease::{LeaseTerms, MAX_CAPACITY_SAT, MIN_CAPACITY_SAT};
 use crate::lease_message::{LeaseMessageError, LeaseOffer};
 use crate::node_binding::Network;
+use crate::rules::{Rules, RulesError};
 
 /// Kind of the liquidity order event (addressable; `d` = order id; tag `k` says which sort).
 pub const KIND_LEASE_ORDER: u16 = 38735;
@@ -94,6 +95,8 @@ pub struct LeaseOrder {
     pub expires_at: u64,
     /// The bond the buyer locks at the instance while the lease is set up, in satoshi; 0 for none.
     pub bond_sat: u64,
+    /// What the buyer's node must show in the public graph ([`Rules`]); the optional `rules` tag.
+    pub rules: Rules,
 }
 
 fn field(what: &'static str) -> LeaseMessageError {
@@ -130,6 +133,22 @@ fn tag_values<'a>(
     Ok(&tag[1..])
 }
 
+/// The optional `rules` tag: none, or exactly one, read strictly ([`Rules::from_tag_values`]).
+pub(crate) fn rules_tag(event: &Event) -> Result<Rules, RulesError> {
+    let mut found = event
+        .tags
+        .iter()
+        .map(|t| t.as_slice())
+        .filter(|s| s.first().map(String::as_str) == Some("rules"));
+    let Some(tag) = found.next() else {
+        return Ok(Rules::default());
+    };
+    if found.next().is_some() {
+        return Err(RulesError("more than one rules tag"));
+    }
+    Rules::from_tag_values(&tag[1..])
+}
+
 impl LeaseOrder {
     /// The order an instance publishes for `offer`. The offer must be valid.
     pub fn from_offer(
@@ -153,6 +172,7 @@ impl LeaseOrder {
             announce: offer.announce,
             expires_at: offer.expires_at,
             bond_sat: offer.bond_sat,
+            rules: offer.rules,
         })
     }
 
@@ -187,6 +207,7 @@ impl LeaseOrder {
         if !bond_ok {
             return Err(field("bond"));
         }
+        self.rules.validate().map_err(|_| field("rules"))?;
         Ok(())
     }
 
@@ -210,29 +231,34 @@ impl LeaseOrder {
     pub fn to_event_builder(&self) -> EventBuilder {
         let one = |name: &str, value: String| Tag::custom(name, vec![value]);
         let two = |name: &str, a: String, b: String| Tag::custom(name, vec![a, b]);
-        EventBuilder::new(Kind::Custom(KIND_LEASE_ORDER), "").tags([
-            Tag::identifier(self.id.to_string()),
-            one("k", LEASE_ORDER_K.to_string()),
-            one("s", self.status.as_str().to_string()),
-            one("node", self.seller_node.to_string()),
-            one("network", self.network.as_str().to_string()),
-            two(
-                "capacity",
-                self.min_capacity_sat.to_string(),
-                self.max_capacity_sat.to_string(),
-            ),
-            one("duration", self.duration_blocks.to_string()),
-            two(
-                "fee",
-                self.fee_base_sat.to_string(),
-                self.fee_ppm.to_string(),
-            ),
-            one("split", self.upfront_percent.to_string()),
-            one("confs", self.min_confirmations.to_string()),
-            one("announce", self.announce.to_string()),
-            one("bond", self.bond_sat.to_string()),
-            one("expiration", self.expires_at.to_string()),
-        ])
+        let rules = (!self.rules.is_none()).then(|| Tag::custom("rules", self.rules.tag_values()));
+        EventBuilder::new(Kind::Custom(KIND_LEASE_ORDER), "").tags(
+            [
+                Tag::identifier(self.id.to_string()),
+                one("k", LEASE_ORDER_K.to_string()),
+                one("s", self.status.as_str().to_string()),
+                one("node", self.seller_node.to_string()),
+                one("network", self.network.as_str().to_string()),
+                two(
+                    "capacity",
+                    self.min_capacity_sat.to_string(),
+                    self.max_capacity_sat.to_string(),
+                ),
+                one("duration", self.duration_blocks.to_string()),
+                two(
+                    "fee",
+                    self.fee_base_sat.to_string(),
+                    self.fee_ppm.to_string(),
+                ),
+                one("split", self.upfront_percent.to_string()),
+                one("confs", self.min_confirmations.to_string()),
+                one("announce", self.announce.to_string()),
+                one("bond", self.bond_sat.to_string()),
+                one("expiration", self.expires_at.to_string()),
+            ]
+            .into_iter()
+            .chain(rules),
+        )
     }
 
     /// Reads and checks an order event: its own id and signature, the kind, `k` = `lease`,
@@ -283,6 +309,7 @@ impl LeaseOrder {
             announce,
             expires_at: num(&tag_values(event, "expiration", 1)?[0], "expiration")?,
             bond_sat: num(&tag_values(event, "bond", 1)?[0], "bond")?,
+            rules: rules_tag(event).map_err(|_| field("rules"))?,
         };
         order.validate()?;
         Ok(order)
@@ -319,6 +346,7 @@ mod tests {
             announce: true,
             expires_at: 1_794_886_400,
             bond_sat: 0,
+            rules: Rules::default(),
         }
     }
 
@@ -574,5 +602,55 @@ mod tests {
             LeaseOrder::from_event(&tampered),
             Err(field("event signature"))
         );
+    }
+
+    #[test]
+    fn rules_travel_in_an_optional_tag_and_are_read_strictly() {
+        // None set: no tag, and the event is what it was before rules existed.
+        assert!(!tags(&order()).iter().any(|t| t[0] == "rules"));
+        let mut strict = offer();
+        strict.rules = Rules {
+            min_channels: 3,
+            min_capacity_sat: 5_000_000,
+        };
+        let order =
+            LeaseOrder::from_offer(order().id, LeaseOrderStatus::Pending, &strict).expect("order");
+        let written = tags(&order);
+        assert!(written.contains(&vec![
+            "rules".to_string(),
+            "min_channels=3".to_string(),
+            "min_capacity_sat=5000000".to_string(),
+        ]));
+        let read =
+            LeaseOrder::from_event(&signed(KIND_LEASE_ORDER, written.clone())).expect("read");
+        assert_eq!(read.rules, strict.rules);
+
+        let bend = |f: &dyn Fn(&mut Vec<Vec<String>>)| {
+            let mut t = written.clone();
+            f(&mut t);
+            LeaseOrder::from_event(&signed(KIND_LEASE_ORDER, t))
+        };
+        let twice = bend(&|t| {
+            let rules = t.iter().find(|t| t[0] == "rules").cloned().expect("rules");
+            t.push(rules);
+        });
+        assert!(twice.is_err());
+        let unknown = bend(&|t| {
+            for tag in t.iter_mut().filter(|t| t[0] == "rules") {
+                tag.push("clearnet=1".into());
+            }
+        });
+        assert!(unknown.is_err());
+        let empty = bend(&|t| {
+            for tag in t.iter_mut().filter(|t| t[0] == "rules") {
+                tag.truncate(1);
+            }
+        });
+        assert!(empty.is_err());
+
+        // An offer with rules out of range is refused.
+        let mut wild = offer();
+        wild.rules.min_channels = 1_000_000;
+        assert!(wild.validate().is_err());
     }
 }
