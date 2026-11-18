@@ -601,7 +601,8 @@ mod tests {
             Outcome::from_event(&bent(&good, |t| t.push(vec!["client".into(), "x".into()])))
                 .is_ok()
         );
-        let cases: Vec<Box<dyn Fn(&mut Vec<Vec<String>>)>> = vec![
+        type Bend = Box<dyn Fn(&mut Vec<Vec<String>>)>;
+        let cases: Vec<Bend> = vec![
             Box::new(|t| t.retain(|t| t[0] != "k")),
             Box::new(|t| t.push(vec!["k".into(), "lease".into()])),
             Box::new(|t| t.retain(|t| t[0] != "result")),
