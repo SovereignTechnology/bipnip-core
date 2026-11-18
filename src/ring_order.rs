@@ -14,10 +14,11 @@ use std::str::FromStr;
 use nostr_sdk::prelude::{Event, EventBuilder, Kind, Tag};
 use uuid::Uuid;
 
-use crate::lease_order::KIND_LEASE_ORDER;
+use crate::lease_order::{rules_tag, KIND_LEASE_ORDER};
 use crate::node_binding::Network;
 use crate::ring::{RingTerms, MAX_RING_SIZE, MIN_RING_SIZE};
 use crate::ring_message::{RingMessageError, RingOffer};
+use crate::rules::Rules;
 
 /// The `k` tag of a ring order.
 pub const RING_ORDER_K: &str = "ring";
@@ -89,6 +90,9 @@ pub struct RingOrder {
     pub bond_sat: u64,
     /// Unix seconds after which open slots can no longer be taken.
     pub expires_at: u64,
+    /// What every member's node must show in the public graph ([`Rules`]); the optional `rules`
+    /// tag.
+    pub rules: Rules,
 }
 
 fn field(what: &'static str) -> RingMessageError {
@@ -146,6 +150,7 @@ impl RingOrder {
             open_window_secs: offer.open_window_secs,
             bond_sat: offer.bond_sat,
             expires_at: offer.expires_at,
+            rules: offer.rules,
         };
         order.validate()?;
         Ok(order)
@@ -159,6 +164,7 @@ impl RingOrder {
             announce: self.announce,
             open_window_secs: self.open_window_secs,
             bond_sat: self.bond_sat,
+            rules: self.rules,
         }
     }
 
@@ -186,21 +192,26 @@ impl RingOrder {
     /// The unsigned order event, for the instance to sign.
     pub fn to_event_builder(&self) -> EventBuilder {
         let one = |name: &str, value: String| Tag::custom(name, vec![value]);
-        EventBuilder::new(Kind::Custom(KIND_LEASE_ORDER), "").tags([
-            Tag::identifier(self.id.to_string()),
-            one("k", RING_ORDER_K.to_string()),
-            one("s", self.status.as_str().to_string()),
-            one("network", self.network.as_str().to_string()),
-            Tag::custom(
-                "slots",
-                vec![self.slots.to_string(), self.taken.to_string()],
-            ),
-            one("capacity", self.capacity_sat.to_string()),
-            one("announce", self.announce.to_string()),
-            one("window", self.open_window_secs.to_string()),
-            one("bond", self.bond_sat.to_string()),
-            one("expiration", self.expires_at.to_string()),
-        ])
+        let rules = (!self.rules.is_none()).then(|| Tag::custom("rules", self.rules.tag_values()));
+        EventBuilder::new(Kind::Custom(KIND_LEASE_ORDER), "").tags(
+            [
+                Tag::identifier(self.id.to_string()),
+                one("k", RING_ORDER_K.to_string()),
+                one("s", self.status.as_str().to_string()),
+                one("network", self.network.as_str().to_string()),
+                Tag::custom(
+                    "slots",
+                    vec![self.slots.to_string(), self.taken.to_string()],
+                ),
+                one("capacity", self.capacity_sat.to_string()),
+                one("announce", self.announce.to_string()),
+                one("window", self.open_window_secs.to_string()),
+                one("bond", self.bond_sat.to_string()),
+                one("expiration", self.expires_at.to_string()),
+            ]
+            .into_iter()
+            .chain(rules),
+        )
     }
 
     /// Reads and checks an order event: its own id and signature, the kind, `k` = `ring`,
@@ -239,6 +250,7 @@ impl RingOrder {
             open_window_secs: num(&tag_values(event, "window", 1)?[0], "window")?,
             bond_sat: num(&tag_values(event, "bond", 1)?[0], "bond")?,
             expires_at: num(&tag_values(event, "expiration", 1)?[0], "expiration")?,
+            rules: rules_tag(event).map_err(|_| field("rules"))?,
         };
         order.validate()?;
         Ok(order)
@@ -275,6 +287,7 @@ mod tests {
                 binding: "{}".into(),
                 node_address: None,
             },
+            rules: Rules::default(),
         }
     }
 
@@ -481,5 +494,18 @@ mod tests {
             .finalize(&Keys::generate())
             .expect("signs");
         assert!(LeaseOrder::from_event(&ring).is_err());
+    }
+
+    #[test]
+    fn a_ring_orders_rules_are_its_terms_rules() {
+        assert!(!tags(&order()).iter().any(|t| t[0] == "rules"));
+        let mut strict = offer();
+        strict.rules.min_capacity_sat = 1_000_000;
+        let order =
+            RingOrder::from_offer(order_id(), RingOrderStatus::Pending, 1, &strict).expect("order");
+        assert_eq!(order.terms().rules, strict.rules);
+        let read = RingOrder::from_event(&signed(KIND_LEASE_ORDER, tags(&order))).expect("read");
+        assert_eq!(read.rules, strict.rules);
+        assert_eq!(read.terms(), strict.terms());
     }
 }

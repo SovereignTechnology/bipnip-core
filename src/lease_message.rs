@@ -33,6 +33,9 @@ use crate::message::{Action, Payload};
 use crate::node_binding::{
     Action as BindingAction, BindingError, Network, SignedStatement, MAX_FUTURE_SKEW_SECS,
 };
+use crate::rules::Rules;
+#[cfg(test)]
+use crate::rules::MAX_MIN_CAPACITY_SAT;
 
 /// Longest binding event (as JSON) a lease message may carry.
 pub const MAX_BINDING_JSON_LEN: usize = 4_096;
@@ -223,6 +226,10 @@ pub struct LeaseOffer {
     /// never released the preimage. Needs an announced channel: the instance takes a bond only
     /// on what its own node can see.
     pub bond_sat: u64,
+    /// What the buyer's node must show in the public graph to take the offer ([`Rules`]).
+    /// Absent when none is set.
+    #[serde(default, skip_serializing_if = "Rules::is_none")]
+    pub rules: Rules,
 }
 
 impl LeaseOffer {
@@ -256,6 +263,9 @@ impl LeaseOffer {
         if !bond_ok {
             return Err(LeaseMessageError::Field("bond_sat"));
         }
+        self.rules
+            .validate()
+            .map_err(|_| LeaseMessageError::Field("rules"))?;
         Ok(())
     }
 
@@ -605,6 +615,7 @@ mod tests {
             announce: true,
             expires_at: NOW + 86_400,
             bond_sat: 0,
+            rules: Rules::default(),
         }
     }
 
@@ -1156,5 +1167,20 @@ mod tests {
             Some(Payload::Lease(payloads[0].clone())),
         );
         assert!(!as_order.verify());
+    }
+
+    #[test]
+    fn an_offer_without_rules_is_written_as_before_and_one_with_rules_carries_them() {
+        let seller = Keys::generate();
+        let plain = offer(&seller);
+        let json = serde_json::to_value(&plain).unwrap();
+        assert!(json.get("rules").is_none(), "{json}");
+        let mut strict = plain.clone();
+        strict.rules.min_channels = 3;
+        let json = serde_json::to_value(&strict).unwrap();
+        assert_eq!(json["rules"], serde_json::json!({"min_channels": 3}));
+        assert_eq!(serde_json::from_value::<LeaseOffer>(json).unwrap(), strict);
+        strict.rules.min_capacity_sat = MAX_MIN_CAPACITY_SAT + 1;
+        assert_eq!(strict.validate(), Err(LeaseMessageError::Field("rules")));
     }
 }
