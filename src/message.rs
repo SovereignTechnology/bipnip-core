@@ -2468,6 +2468,26 @@ mod test {
             | Action::ReputationExported
             | Action::ImportReputation
             | Action::ReputationImported => {}
+            // bipnip: liquidity leases and rings carry their own payloads only.
+            Action::LeaseOffer
+            | Action::TakeLease
+            | Action::LeaseInvoice
+            | Action::LeaseChannelOpened
+            | Action::LeasePreimage
+            | Action::LeaseActive
+            | Action::LeaseCompletionInvoice
+            | Action::LeaseBondInvoice
+            | Action::LeaseBondClaim
+            | Action::RingOffer
+            | Action::TakeRingSlot
+            | Action::RingRoster
+            | Action::RingCommit
+            | Action::RingOpen
+            | Action::RingEdgeOpened
+            | Action::RingEdgeVerified
+            | Action::RingClosed
+            | Action::RingBondInvoice
+            | Action::RingBondClaim => {}
         };
 
         let id = uuid!("308e1272-d5f4-47e6-bd97-3504baea9c23");
@@ -2531,6 +2551,25 @@ mod test {
             Action::ReputationExported,
             Action::ImportReputation,
             Action::ReputationImported,
+            Action::LeaseOffer,
+            Action::TakeLease,
+            Action::LeaseInvoice,
+            Action::LeaseChannelOpened,
+            Action::LeasePreimage,
+            Action::LeaseActive,
+            Action::LeaseCompletionInvoice,
+            Action::LeaseBondInvoice,
+            Action::LeaseBondClaim,
+            Action::RingOffer,
+            Action::TakeRingSlot,
+            Action::RingRoster,
+            Action::RingCommit,
+            Action::RingOpen,
+            Action::RingEdgeOpened,
+            Action::RingEdgeVerified,
+            Action::RingClosed,
+            Action::RingBondInvoice,
+            Action::RingBondClaim,
         ] {
             let payload = Payload::OrderInfo(sample_order_info(id));
             // With an id, and without one for the actions that carry none.
